@@ -49,6 +49,7 @@ void updateExtendedCasName(int drive, char* filename, char* zipFile);
 
 int createSaveFileBaseName(char* fileBase,Properties* properties, int useExtendedName);
 char* generateSaveFilename(Properties* properties, char* directory, char* prefix, char* extension, int digits);
+char* generateSlotSaveFilename(Properties* properties, char* directory, char* prefix, char* extension, int slot);
 
 #endif
 

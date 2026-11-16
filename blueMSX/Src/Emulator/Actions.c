@@ -740,6 +740,32 @@ void actionQuickSaveStateUndo() {
     }
 }
 
+void actionGetSlotFilename(int slot, char* buffer)
+{
+    strcpy(buffer, generateSlotSaveFilename(state.properties, stateDir, statePrefix, ".sta", slot));
+}
+
+void actionSaveStateSlot(int slot)
+{
+    if (emulatorGetState() == EMU_STOPPED) {
+        return;
+    }
+    emulatorSuspend();
+    boardSaveState(generateSlotSaveFilename(state.properties, stateDir, statePrefix, ".sta", slot), 1);
+    emulatorResume();
+    archUpdateMenu(0);
+}
+
+void actionLoadStateSlot(int slot)
+{
+    char* filename = generateSlotSaveFilename(state.properties, stateDir, statePrefix, ".sta", slot);
+    if (fileExist(filename, NULL)) {
+        emulatorStop();
+        emulatorStart(filename);
+    }
+    archUpdateMenu(0);
+}
+
 void actionCartInsert1() {
     actionCartInsert(0);
 }

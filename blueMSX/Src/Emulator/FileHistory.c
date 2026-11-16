@@ -652,3 +652,14 @@ char* generateSaveFilename(Properties* properties, char* directory, char* prefix
     return filename;
 }
 #endif
+
+char* generateSlotSaveFilename(Properties* properties, char* directory, char* prefix, char* extension, int slot)
+{
+    static char filename[512];
+    char baseName[128];
+
+    createSaveFileBaseName(baseName, properties, 0);
+    sprintf(filename, "%s" DIR_SEPARATOR "%s%s_slot%d%s", directory, prefix, baseName, slot, extension);
+
+    return filename;
+}

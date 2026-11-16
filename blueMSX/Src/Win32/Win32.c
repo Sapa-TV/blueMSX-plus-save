@@ -2529,6 +2529,428 @@ static int themePageOwnerIsClassic(void)
             strcmp(st.themePageOwner->name, "Classic Dark") == 0);
 }
 
+
+//////////////////////////////////////////////////////////////////////////
+// Slot sidebar: per-ROM quick-save cards docked to the right of the emu
+// area, in windowed mode and in fullscreen. One card per slot with a red
+// save and a blue load button.
+//////////////////////////////////////////////////////////////////////////
+
+#define SLOT_COUNT                  5
+#define ID_SLOT_BASE                9100
+#define ID_SLOT_END                 (ID_SLOT_BASE + 4 * SLOT_COUNT)
+#define idSlotSave(i)               (ID_SLOT_BASE + (i))
+#define idSlotLoad(i)               (ID_SLOT_BASE + SLOT_COUNT + (i))
+#define idSlotLabel(i)              (ID_SLOT_BASE + 2 * SLOT_COUNT + (i))
+#define idSlotInfo(i)               (ID_SLOT_BASE + 3 * SLOT_COUNT + (i))
+
+#define TIMER_SLOT_REFRESH          15
+
+#define SLOT_PANEL_COLOR   RGB(  0,  0,  0)
+#define SLOT_CARD_COLOR    RGB( 42, 42, 46)
+#define SLOT_SAVE_COLOR    RGB(176, 48, 48)
+#define SLOT_LOAD_COLOR    RGB( 46, 86,166)
+#define SLOT_DISABLED_COLOR RGB( 62, 62, 68)
+#define SLOT_CANCEL_COLOR  RGB( 96, 96,102)
+#define SLOT_CONFIRM_TIMEOUT_MS 6000
+
+#define SLOT_CONFIRM_NONE  0
+#define SLOT_CONFIRM_SAVE  1
+#define SLOT_CONFIRM_LOAD  2
+
+static HWND  g_slotInfo[SLOT_COUNT];
+static HWND  g_slotButtons[2 * SLOT_COUNT];
+static HFONT g_slotFont;
+static int   g_slotFontDpi;
+static HBRUSH g_slotPanelBrush;
+static HBRUSH g_slotCardBrush;
+static RECT  g_slotCards[SLOT_COUNT];
+static int   g_sidebarX;
+static RECT  g_slotVideoRect;
+/* Pending inline confirmation per card: the two buttons temporarily
+   become "confirm" and "cancel"; auto-expires via the refresh timer. */
+static int   g_slotConfirm[SLOT_COUNT];
+static DWORD g_slotConfirmTick[SLOT_COUNT];
+
+static const char* slotTextSave  = "Сохранить";
+static const char* slotTextLoad  = "Загрузить";
+static const char* slotTextOk    = "Точно";
+static const char* slotTextOverwrite = "Перезаписать";
+static const char* slotTextCancel = "Отмена";
+
+static int slotSidebarDpi(void)
+{
+    return (int)getDpiForWindow(st.hwnd);
+}
+
+static int slotS(int v)
+{
+    return v * slotSidebarDpi() / 96;
+}
+
+static int slotSidebarW(void)
+{
+    return slotS(190);
+}
+
+static void slotFontsCreate(void)
+{
+    int h = slotS(19);
+    LOGFONTW lf = {0};
+    if (g_slotFont && g_slotFontDpi == slotSidebarDpi()) {
+        return;
+    }
+    g_slotFontDpi = slotSidebarDpi();
+    lf.lfHeight  = -h;
+    lf.lfWeight  = FW_SEMIBOLD;
+    lf.lfCharSet = DEFAULT_CHARSET;
+    wcscpy(lf.lfFaceName, L"Segoe UI");
+    if (g_slotFont) DeleteObject(g_slotFont);
+    g_slotFont = CreateFontIndirectW(&lf);
+}
+
+static void slotSidebarRefresh(void);
+
+static void slotSidebarCreate(void)
+{
+    HINSTANCE hInstance = GetModuleHandle(NULL);
+    int i;
+
+    if (g_slotInfo[0] != NULL) {
+        return;
+    }
+    g_slotPanelBrush = CreateSolidBrush(SLOT_PANEL_COLOR);
+    g_slotCardBrush = CreateSolidBrush(SLOT_CARD_COLOR);
+    slotFontsCreate();
+    for (i = 0; i < SLOT_COUNT; i++) {
+        g_slotInfo[i] = CreateWindowExW(0, L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 0, 0, 10, 10, st.hwnd,
+            (HMENU)(INT_PTR)idSlotInfo(i), hInstance, NULL);
+        SendMessage(g_slotInfo[i], WM_SETFONT, (WPARAM)g_slotFont, TRUE);
+        g_slotButtons[2 * i] = CreateWindowExW(0, L"BUTTON", L"",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 10, 10, st.hwnd,
+            (HMENU)(INT_PTR)idSlotSave(i), hInstance, NULL);
+        g_slotButtons[2 * i + 1] = CreateWindowExW(0, L"BUTTON", L"",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 10, 10, st.hwnd,
+            (HMENU)(INT_PTR)idSlotLoad(i), hInstance, NULL);
+    }
+    slotSidebarRefresh();
+}
+
+/* Positions the 5 cards inside the sidebar strip; g_sidebarX and the
+   strip's client width must already be up to date. */
+static void slotSidebarLayoutCards(int stripW, int stripH)
+{
+    int margin  = slotS(8);
+    int gap     = slotS(8);
+    int inset   = slotS(6);
+    int padTop  = slotS(6);
+    int padBot  = slotS(6);
+    int infoGap = slotS(6);
+    int cardW   = stripW - 2 * margin;
+    int cardH   = (stripH - 2 * margin - (SLOT_COUNT - 1) * gap) / SLOT_COUNT;
+    int btnH, infoH, y, i;
+
+    if (cardH > slotS(220)) cardH = slotS(220);
+    /* Three equal rows: info line, save, load. The info text is centered
+       in the empty space between the card top and the save button. */
+    btnH = (cardH - padTop - padBot - 2 * infoGap) / 3;
+    infoH = slotS(24);
+    y = (stripH - (SLOT_COUNT * cardH + (SLOT_COUNT - 1) * gap)) / 2;
+    if (y < margin) y = margin;
+
+    for (i = 0; i < SLOT_COUNT; i++) {
+        g_slotCards[i].left   = g_sidebarX + margin;
+        g_slotCards[i].top    = y;
+        g_slotCards[i].right  = g_slotCards[i].left + cardW;
+        g_slotCards[i].bottom = y + cardH;
+        SetWindowPos(g_slotInfo[i], NULL,
+                     g_slotCards[i].left + inset, y + padTop + (btnH - infoH) / 2,
+                     cardW - 2 * inset, infoH, SWP_NOZORDER);
+        SetWindowPos(g_slotButtons[2 * i], NULL,
+                     g_slotCards[i].left + inset, y + padTop + btnH + infoGap,
+                     cardW - 2 * inset, btnH, SWP_NOZORDER);
+        SetWindowPos(g_slotButtons[2 * i + 1], NULL,
+                     g_slotCards[i].left + inset, y + padTop + 2 * btnH + 2 * infoGap,
+                     cardW - 2 * inset, btnH, SWP_NOZORDER);
+        y += cardH + gap;
+    }
+    InvalidateRect(st.hwnd, NULL, FALSE);
+}
+
+/* Windowed mode: the sidebar starts right of the theme page / emu area
+   (baseClientW) and spans the full client height. */
+static void slotSidebarLayoutWindowed(int baseClientW, int clientH)
+{
+    if (g_slotInfo[0] == NULL) {
+        return;
+    }
+    g_sidebarX = baseClientW;
+    slotFontsCreate();
+    slotSidebarLayoutCards(slotSidebarW(), clientH);
+}
+
+/* Fullscreen: video keeps the native 320x240 aspect ratio at an integer
+   scale on the left, the sidebar takes the rest on the right. */
+static void slotSidebarLayoutFullscreen(void)
+{
+    HMONITOR mon;
+    MONITORINFO mi = { sizeof(mi) };
+    int sw, sh, sbw, scale, vw, vh;
+
+    if (g_slotInfo[0] == NULL ||
+        pProperties->video.windowSize != P_VIDEO_SIZEFULLSCREEN) {
+        return;
+    }
+    mon = MonitorFromWindow(st.hwnd, MONITOR_DEFAULTTOPRIMARY);
+    if (!GetMonitorInfo(mon, &mi)) {
+        return;
+    }
+    sw = mi.rcMonitor.right - mi.rcMonitor.left;
+    sh = mi.rcMonitor.bottom - mi.rcMonitor.top;
+    sbw = slotSidebarW();
+
+    scale = min((sw - sbw - slotS(24)) / WIDTH, sh / HEIGHT);
+    if (scale < 1) scale = 1;
+    vw = scale * WIDTH;
+    vh = scale * HEIGHT;
+    g_slotVideoRect.left   = (sw - sbw - vw) / 2;
+    g_slotVideoRect.top    = (sh - vh) / 2;
+    g_slotVideoRect.right  = g_slotVideoRect.left + vw;
+    g_slotVideoRect.bottom = g_slotVideoRect.top + vh;
+
+    /* Center the card column in the black area right of the video. */
+    g_sidebarX = g_slotVideoRect.right + (sw - g_slotVideoRect.right - sbw) / 2;
+
+    SetWindowPos(st.emuHwnd, NULL,
+                 g_slotVideoRect.left, g_slotVideoRect.top, vw, vh,
+                 SWP_NOZORDER | SWP_SHOWWINDOW);
+    slotFontsCreate();
+    slotSidebarLayoutCards(sbw, sh);
+}
+
+static void slotSidebarGetFilename(int slot, char* buffer)
+{
+    actionGetSlotFilename(slot, buffer);
+}
+
+static void slotSidebarSetConfirm(int i, int mode)
+{
+    g_slotConfirm[i] = mode;
+    g_slotConfirmTick[i] = GetTickCount();
+    InvalidateRect(g_slotButtons[2 * i], NULL, TRUE);
+    InvalidateRect(g_slotButtons[2 * i + 1], NULL, TRUE);
+}
+
+static void slotSidebarCancelConfirm(int i)
+{
+    if (g_slotConfirm[i] != SLOT_CONFIRM_NONE) {
+        slotSidebarSetConfirm(i, SLOT_CONFIRM_NONE);
+    }
+}
+
+static void slotSidebarRefresh(void)
+{
+    int i;
+
+    if (g_slotInfo[0] == NULL) {
+        return;
+    }
+    for (i = 0; i < SLOT_COUNT; i++) {
+        char filename[PROP_MAXPATH];
+        BOOL hasState;
+        if (g_slotConfirm[i] != SLOT_CONFIRM_NONE &&
+            GetTickCount() - g_slotConfirmTick[i] > SLOT_CONFIRM_TIMEOUT_MS) {
+            slotSidebarCancelConfirm(i);
+        }
+        slotSidebarGetFilename(i + 1, filename);
+        hasState = fileExist(filename, NULL);
+        {
+            /* Status line: "пустой слот", or the save's local date and time. */
+            WIN32_FILE_ATTRIBUTE_DATA fa;
+            char info[64];
+            if (!hasState) {
+                strcpy(info, "пустой слот");
+            }
+            else {
+                wchar_t wname[512];
+                Utf8ToWide(filename, wname, _countof(wname));
+                if (GetFileAttributesExW(wname, GetFileExInfoStandard, &fa)) {
+                    FILETIME lt;
+                    SYSTEMTIME st2;
+                    FileTimeToLocalFileTime(&fa.ftLastWriteTime, &lt);
+                    FileTimeToSystemTime(&lt, &st2);
+                    sprintf(info, "%02d:%02d %02d.%02d.%04d",
+                            st2.wHour, st2.wMinute,
+                            st2.wDay, st2.wMonth, st2.wYear);
+                }
+                else {
+                    strcpy(info, "есть сохранение");
+                }
+            }
+            SetWindowTextU(g_slotInfo[i], info);
+        }
+        /* In confirm mode the other button doubles as "cancel", so it
+           must stay clickable even when its normal action is disabled. */
+        EnableWindow(g_slotButtons[2 * i],
+                     emulatorGetState() != EMU_STOPPED ||
+                     g_slotConfirm[i] == SLOT_CONFIRM_LOAD);
+        EnableWindow(g_slotButtons[2 * i + 1],
+                     hasState || g_slotConfirm[i] == SLOT_CONFIRM_SAVE);
+        InvalidateRect(g_slotButtons[2 * i], NULL, TRUE);
+        InvalidateRect(g_slotButtons[2 * i + 1], NULL, TRUE);
+    }
+}
+
+static void slotSidebarDoSave(int slot)
+{
+    int i = slot - 1;
+    char filename[PROP_MAXPATH];
+
+    if (emulatorGetState() == EMU_STOPPED) {
+        return;
+    }
+    if (g_slotConfirm[i] == SLOT_CONFIRM_SAVE) {
+        /* Same button now reads cancel. */
+        slotSidebarCancelConfirm(i);
+        return;
+    }
+    if (g_slotConfirm[i] == SLOT_CONFIRM_LOAD) {
+        /* Other button reads confirm: it says "Точно" for the load. */
+        slotSidebarCancelConfirm(i);
+        actionLoadStateSlot(slot);
+        slotSidebarRefresh();
+        SetFocus(st.hwnd);
+        return;
+    }
+    slotSidebarGetFilename(slot, filename);
+    if (fileExist(filename, NULL)) {
+        slotSidebarSetConfirm(i, SLOT_CONFIRM_SAVE);
+        return;
+    }
+    actionSaveStateSlot(slot);
+    slotSidebarRefresh();
+    SetFocus(st.hwnd);
+}
+
+static void slotSidebarDoLoad(int slot)
+{
+    int i = slot - 1;
+    char filename[PROP_MAXPATH];
+
+    slotSidebarGetFilename(slot, filename);
+    if (!fileExist(filename, NULL)) {
+        return;
+    }
+    if (g_slotConfirm[i] == SLOT_CONFIRM_LOAD) {
+        /* Same button now reads cancel. */
+        slotSidebarCancelConfirm(i);
+        return;
+    }
+    if (g_slotConfirm[i] == SLOT_CONFIRM_SAVE) {
+        /* Other button reads confirm: it says "Перезаписать" for the save. */
+        slotSidebarCancelConfirm(i);
+        actionSaveStateSlot(slot);
+        slotSidebarRefresh();
+        SetFocus(st.hwnd);
+        return;
+    }
+    slotSidebarSetConfirm(i, SLOT_CONFIRM_LOAD);
+}
+
+static void slotSidebarCommand(int id)
+{
+    int i;
+    for (i = 0; i < SLOT_COUNT; i++) {
+        if (id == idSlotSave(i)) { slotSidebarDoSave(i + 1); return; }
+        if (id == idSlotLoad(i)) { slotSidebarDoLoad(i + 1); return; }
+    }
+}
+
+/* Owner-draw: solid red / blue face, white centered label. In confirm
+   mode the pair temporarily reads confirm / cancel. */
+static void slotSidebarDrawItem(DRAWITEMSTRUCT* dis)
+{
+    int isSave = dis->CtlID < idSlotLoad(0);
+    int idx = isSave ? dis->CtlID - ID_SLOT_BASE
+                     : dis->CtlID - idSlotLoad(0);
+    int mode = g_slotConfirm[idx];
+    const char* label;
+    int disabled = dis->itemState & ODS_DISABLED;
+    COLORREF face;
+    HBRUSH brush;
+    wchar_t text[32];
+    HFONT prev;
+
+    /* Confirm sits on the OTHER button, cancel on the one just clicked:
+       a double-click lands on cancel, never on the destructive action. */
+    if (mode == SLOT_CONFIRM_SAVE) {
+        label = isSave ? slotTextCancel      : slotTextOverwrite;
+        face  = isSave ? SLOT_CANCEL_COLOR   : SLOT_SAVE_COLOR;
+    }
+    else if (mode == SLOT_CONFIRM_LOAD) {
+        label = isSave ? slotTextOk          : slotTextCancel;
+        face  = isSave ? SLOT_LOAD_COLOR     : SLOT_CANCEL_COLOR;
+    }
+    else {
+        label = isSave ? slotTextSave      : slotTextLoad;
+        face  = disabled ? SLOT_DISABLED_COLOR
+              : isSave   ? SLOT_SAVE_COLOR
+              :            SLOT_LOAD_COLOR;
+    }
+
+    brush = CreateSolidBrush(face);
+    FillRect(dis->hDC, &dis->rcItem, brush);
+    DeleteObject(brush);
+    FrameRect(dis->hDC, &dis->rcItem, (HBRUSH)GetStockObject(BLACK_BRUSH));
+
+    prev = (HFONT)SelectObject(dis->hDC, g_slotFont);
+    SetBkMode(dis->hDC, TRANSPARENT);
+    SetTextColor(dis->hDC, disabled && mode == SLOT_CONFIRM_NONE
+                          ? RGB(160, 160, 160) : RGB(255, 255, 255));
+    Utf8ToWide(label, text, _countof(text));
+    DrawTextW(dis->hDC, text, -1, &dis->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(dis->hDC, prev);
+}
+
+/* Panel + card backgrounds; called at the end of the main window's
+   WM_PAINT, after the theme has been blitted. */
+static void slotSidebarPaint(HDC hdc)
+{
+    int i;
+    RECT rc;
+
+    if (g_slotInfo[0] == NULL || g_sidebarX <= 0) {
+        return;
+    }
+    GetClientRect(st.hwnd, &rc);
+    if (rc.right <= g_sidebarX) {
+        return;
+    }
+    rc.left = g_sidebarX;
+    FillRect(hdc, &rc, g_slotPanelBrush);
+    for (i = 0; i < SLOT_COUNT; i++) {
+        FillRect(hdc, &g_slotCards[i], g_slotCardBrush);
+    }
+}
+
+static void slotSidebarOnCommand(WPARAM wParam, LPARAM lParam)
+{
+    (void)lParam;
+    if ((int)LOWORD(wParam) >= ID_SLOT_BASE && (int)LOWORD(wParam) < ID_SLOT_END) {
+        if (HIWORD(wParam) == BN_CLICKED) {
+            slotSidebarCommand(LOWORD(wParam));
+        }
+    }
+}
+
+static int slotSidebarIsLabel(HWND hwnd)
+{
+    int id = GetDlgCtrlID(hwnd);
+    return id >= idSlotInfo(0) && id < ID_SLOT_END;
+}
+
+
 void themeSet(char* themeName, int forceMatch) {
     int x  = 0;
     int y  = 0;
@@ -2638,7 +3060,7 @@ void themeSet(char* themeName, int forceMatch) {
         // Enclose both the theme bitmap and the emu rect: at zoom>=5 the
         // x2 fallback theme is smaller than the emu extent and would
         // otherwise clip it against the window frame.
-        clientW = max((int)st.themePageActive->width,  ex + ew);
+        clientW = max((int)st.themePageActive->width,  ex + ew) + slotSidebarW();
         clientH = max((int)st.themePageActive->height, ey + eh);
         {
             RECT rc = { 0, 0, clientW, clientH };
@@ -2655,6 +3077,7 @@ void themeSet(char* themeName, int forceMatch) {
 
         SetWindowPos(st.hwnd, z, x, y, w, h, SWP_SHOWWINDOW);
         SetWindowPos(st.emuHwnd, NULL, ex, ey, ew, eh, SWP_NOZORDER);
+        slotSidebarLayoutWindowed(clientW - slotSidebarW(), clientH);
     }
 
     if (st.hBitmap) { DeleteObject(st.hBitmap); st.hBitmap=NULL; }
@@ -2683,81 +3106,17 @@ void themeSet(char* themeName, int forceMatch) {
     if (pProperties->video.windowSize == P_VIDEO_SIZEFULLSCREEN) {
         st.rgnEnable = -1;
         setClipRegion(0);
-    } 
+    }
     else {
-        int clipCount = st.themePageActive->clipPoint.count;
-        st.clipAlways = st.themePageActive->noFrame;
-
-        if (clipCount > 0 || st.clipAlways) {
-            int i;
-            HRGN hrgn;
-            POINT pt[512];
-            /* SM_CXFIXEDFRAME is non-DPI-aware 3px; adjustWindowRectForDpi
-               gives actual WS_DLGFRAME margins so SetWindowRgn doesn't
-               clip the bitmap. */
-            int dx, dy;
-            {
-                RECT frameRc = { 0, 0, 0, 0 };
-                DWORD style = (DWORD)GetWindowLongPtr(st.hwnd, GWL_STYLE);
-                adjustWindowRectForDpi(&frameRc, style, getDpiForWindow(st.hwnd));
-                dx = -frameRc.left;
-                dy = -frameRc.top;
-            }
-
-            if (clipCount == 0) {
-                pt[0].x = 0 + dx;
-                pt[0].y = 0 + dy;
-                pt[1].x = st.themePageActive->width + dx;
-                pt[1].y = 0 + dy;
-                pt[2].x = st.themePageActive->width + dx;
-                pt[2].y = st.themePageActive->height + dy;
-                pt[3].x = 0 + dx;
-                pt[3].y = st.themePageActive->height + dy;
-                clipCount = 4;
-            }
-            else {
-                for (i = 0; i < clipCount; i++) {
-                    ClipPoint cp = st.themePageActive->clipPoint.list[i];
-                    pt[i].x = cp.x + dx;
-                    pt[i].y = cp.y + dy;
-                }
-            }
-
-            hrgn = CreatePolygonRgn(pt, clipCount, WINDING);
-            st.rgnSize = 0;
-            if (hrgn != NULL) {
-                st.rgnSize = GetRegionData(hrgn, 0, NULL);
-                if (st.rgnSize > 0) {
-                    st.rgnData = malloc(st.rgnSize);
-                    st.rgnSize = GetRegionData(hrgn, st.rgnSize, st.rgnData);
-                    if (st.rgnSize == 0) {
-                        free(st.rgnData);
-                        st.rgnData = NULL;
-                    }
-                }
-                if (st.rgnSize == 0) {
-                    st.rgnData = NULL;
-                }
-                else {
-                    st.hrgn = CreateRectRgn(0, 0, w, h);
-                    CombineRgn(st.hrgn, st.hrgn, hrgn, RGN_XOR);
-                }
-                DeleteObject(hrgn);
-            }
-            else {
-                SetWindowRgn(st.hwnd, NULL, TRUE);
-            }
-        }
-
+        /* Slot sidebar extends the window past the theme bitmap; a theme
+           polygon clip region would cut it off, so keep the window
+           rectangular. */
+        st.clipAlways = 0;
         st.rgnEnable = -1;
-        setClipRegion(clipCount > 0);
-
-        if (st.rgnData == NULL) {
-            KillTimer(st.hwnd, TIMER_CLIP_REGION);
-        }
-        else {
-            SetTimer(st.hwnd, TIMER_CLIP_REGION, 500, NULL);
-        }
+        setClipRegion(0);
+        KillTimer(st.hwnd, TIMER_CLIP_REGION);
+        st.rgnData = NULL;
+        st.hrgn = NULL;
     }
 
     InvalidateRect(st.hwnd, NULL, TRUE);
@@ -2853,6 +3212,10 @@ void archUpdateWindow() {
     st.rgnEnable = -1;
     setClipRegion(0);
     themeSet(pProperties->settings.themeName, 1);
+    if (pProperties->video.windowSize == P_VIDEO_SIZEFULLSCREEN) {
+        slotSidebarLayoutFullscreen();
+    }
+    slotSidebarRefresh();
     updateMenu(0);
 
     /* Re-own open aux theme windows (Mixer etc.) for the new fullscreen /
@@ -2872,12 +3235,17 @@ void archUpdateWindow() {
         RECT r = { 0, 0, zoom * WIDTH, zoom * HEIGHT };
         RECT d = { 0, 0, zoom * WIDTH, zoom * HEIGHT };
         if (pProperties->video.windowSize == P_VIDEO_SIZEFULLSCREEN) {
-            WINDOWPLACEMENT p;
-            GetWindowPlacement(st.hwnd, &p);
-            r.right  = p.rcNormalPosition.right - p.rcNormalPosition.left;
-            r.bottom = p.rcNormalPosition.bottom - p.rcNormalPosition.top;
+            /* Sidebar layout moved the emu window to the native-AR video
+               rect; capture maps against that, not the whole monitor. */
+            int vz = max(1, (g_slotVideoRect.right - g_slotVideoRect.left) / WIDTH);
+            r = g_slotVideoRect;
+            d = g_slotVideoRect;
+            if (!pProperties->video.horizontalStretch) {
+                d.left  += vz * (320 - 272) / 2;
+                d.right -= vz * (320 - 272) / 2;
+            }
         }
-        if (!pProperties->video.horizontalStretch) {
+        else if (!pProperties->video.horizontalStretch) {
             d.left  += zoom * (320 - 272) / 2;
             d.right -= zoom * (320 - 272) / 2;
         }
@@ -3297,6 +3665,10 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT iMsg, WPARAM wParam, LPARAM lPar
         return 0;
 
     case WM_COMMAND:
+        if ((int)LOWORD(wParam) >= ID_SLOT_BASE && (int)LOWORD(wParam) < ID_SLOT_END) {
+            slotSidebarOnCommand(wParam, lParam);
+            return 0;
+        }
         if ( menuCommand(pProperties, LOWORD(wParam))) {
             updateMenu(0);
         }
@@ -3448,6 +3820,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT iMsg, WPARAM wParam, LPARAM lPar
                 }
             }
             themeSet(pProperties->settings.themeName, 1);
+            slotSidebarLayoutFullscreen();
 
             archSetDpiOverride(0);
         }
@@ -3626,6 +3999,10 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT iMsg, WPARAM wParam, LPARAM lPar
             updateClipRegion();
             break;
 
+        case TIMER_SLOT_REFRESH:
+            slotSidebarRefresh();
+            break;
+
         case TIMER_STATUSBAR_UPDATE:
             if (!st.minimized) {
                 static UInt32 resetCnt = 0;
@@ -3648,14 +4025,12 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT iMsg, WPARAM wParam, LPARAM lPar
                 }
 
                 if (pProperties->video.windowSize == P_VIDEO_SIZEFULLSCREEN) {
-                    int drv = pProperties->video.driver;
                     /* DDraw: parent stays windowed; status update goes
-                       direct to hdc (no monitor-sized stretch). */
-                    if (drv == P_VIDEO_DRVDIRECTX_VIDEO ||
-                        drv == P_VIDEO_DRVDIRECTX) {
+                       direct to hdc (no monitor-sized stretch). D3D12
+                       fullscreen shows a plain black frame - no theme. */
+                    if (pProperties->video.driver == P_VIDEO_DRVDIRECTX_VIDEO ||
+                        pProperties->video.driver == P_VIDEO_DRVDIRECTX) {
                         themePageUpdate(st.themePageActive, hdc);
-                    } else {
-                        drawThemeOnEmuArea(hwnd, hdc, themePageUpdate);
                     }
                 } else {
                     themePageUpdate(st.themePageActive, hdc);
@@ -3818,43 +4193,59 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT iMsg, WPARAM wParam, LPARAM lPar
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
             if (!st.minimized) {
-                HDC hMemDC = CreateCompatibleDC(hdc);
-                HBITMAP hBitmap = (HBITMAP)SelectObject(hMemDC, st.hBitmap);
-
                 if (pProperties->video.windowSize != P_VIDEO_SIZEFULLSCREEN) {
+                    HDC hMemDC = CreateCompatibleDC(hdc);
+                    HBITMAP hBitmap = (HBITMAP)SelectObject(hMemDC, st.hBitmap);
+
                     themePageDraw(st.themePageActive, hMemDC, NULL);
                     BitBlt(hdc, 0, 0, st.themePageActive->width, st.themePageActive->height, hMemDC, 0, 0, SRCCOPY);
                     SelectObject(hMemDC, hBitmap);
                     DeleteDC(hMemDC);
                 }
+                else if (pProperties->video.driver == P_VIDEO_DRVDIRECTX_VIDEO ||
+                         pProperties->video.driver == P_VIDEO_DRVDIRECTX) {
+                    /* DDraw fullscreen keeps the parent at windowed size and
+                       flips on the primary surface; keep its theme stretch. */
+                    HDC hMemDC = CreateCompatibleDC(hdc);
+                    HBITMAP hBitmap = (HBITMAP)SelectObject(hMemDC, st.hBitmap);
+                    RECT r;
+                    GetClientRect(hwnd, &r);
+                    themePageDraw(st.themePageActive, hMemDC, NULL);
+                    StretchBlt(hdc, 0, 0, r.right, r.bottom,
+                               hMemDC, 0, 0,
+                               st.themePageActive->width,
+                               st.themePageActive->height, SRCCOPY);
+                    SelectObject(hMemDC, hBitmap);
+                    DeleteDC(hMemDC);
+                }
                 else {
-                    int drv = pProperties->video.driver;
-                    /* DDraw fullscreen keeps the parent at windowed size,
-                       so drawThemeOnEmuArea's monitor-sized StretchBlt
-                       clips and races DDraw flips; use GetClientRect. */
-                    if (drv == P_VIDEO_DRVDIRECTX_VIDEO ||
-                        drv == P_VIDEO_DRVDIRECTX) {
-                        RECT r;
-                        GetClientRect(hwnd, &r);
-                        themePageDraw(st.themePageActive, hMemDC, NULL);
-                        StretchBlt(hdc, 0, 0, r.right, r.bottom,
-                                   hMemDC, 0, 0,
-                                   st.themePageActive->width,
-                                   st.themePageActive->height, SRCCOPY);
-                        SelectObject(hMemDC, hBitmap);
-                        DeleteDC(hMemDC);
-                    } else {
-                        /* D3D12: parent already at monitor pixels;
-                           MonitorFromWindow avoids racing SetWindowPos. */
-                        SelectObject(hMemDC, hBitmap);
-                        DeleteDC(hMemDC);
-                        drawThemeOnEmuArea(hwnd, hdc, themeDrawAllAdapter);
-                    }
+                    /* Black frame in fullscreen: no theme chrome, only the
+                       video rect and the slot sidebar. */
+                    RECT r;
+                    GetClientRect(hwnd, &r);
+                    FillRect(hdc, &r, (HBRUSH)GetStockObject(BLACK_BRUSH));
                 }
             }
+            slotSidebarPaint(hdc);
             EndPaint(hwnd, &ps);
         }
         return 0;
+
+    case WM_DRAWITEM:
+        if ((int)wParam >= ID_SLOT_BASE && (int)wParam < ID_SLOT_END) {
+            slotSidebarDrawItem((DRAWITEMSTRUCT*)lParam);
+            return TRUE;
+        }
+        break;
+
+    case WM_CTLCOLORSTATIC:
+        if (slotSidebarIsLabel((HWND)lParam)) {
+            HDC hdc = (HDC)wParam;
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, RGB(220, 220, 224));
+            return (LRESULT)g_slotCardBrush;
+        }
+        break;
         
     case WM_CLOSE:
         DestroyWindow(hwnd);
@@ -5053,6 +5444,9 @@ WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, PSTR szLine, int iShow)
     midiInSetChannelFilter(pProperties->sound.YkIn.channel);
 
     st.dskWnd = diskQuickviewWindowCreate(st.hwnd);
+
+    slotSidebarCreate();
+    SetTimer(st.hwnd, TIMER_SLOT_REFRESH, 500, NULL);
 
     /* -1,-1 marks "never saved" rather than a coordinate. A monitor left of or
     ** above the primary one gives real negative positions, so both halves are
